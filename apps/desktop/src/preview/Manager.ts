@@ -353,6 +353,7 @@ const normalizeCaptureRect = (value: unknown): PreviewAnnotationRect | null => {
 
 /** `capturePage` never settles when the guest's compositor is wedged. */
 const ANNOTATION_SCREENSHOT_TIMEOUT = "5 seconds";
+const VIEWPORT_LAYOUT_METRICS_TIMEOUT_MS = 2_000;
 
 /**
  * Crops the guest for a picked annotation. A stalled `capturePage` resolves to
@@ -667,6 +668,10 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     PreviewViewportIntent | undefined
   >();
   const rejectedViewportIntents = new WeakSet<PreviewViewportIntent>();
+  const viewportCalibrationVersions = new WeakMap<Electron.WebContents, number>();
+  const invalidateViewportCalibration = (wc: Electron.WebContents) => {
+    viewportCalibrationVersions.set(wc, (viewportCalibrationVersions.get(wc) ?? 0) + 1);
+  };
   const attachedRef = yield* Ref.make<ReadonlyMap<number, ManagedListeners>>(new Map());
   const listenersRef = yield* Ref.make<ReadonlySet<Listener>>(new Set());
   const pointerEventListenersRef = yield* Ref.make<ReadonlySet<PointerEventListener>>(new Set());
@@ -730,6 +735,21 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       try: evaluate,
       catch: (cause) => new PreviewOperationError({ ...errorContext, cause }),
     });
+  const attemptViewportLayoutMetrics = <A>(
+    errorContext: PreviewOperationContext,
+    evaluate: () => PromiseLike<A>,
+  ) =>
+    Effect.tryPromise({
+      // Chromium cannot cancel this command; the signal lets Effect release the
+      // action/toolbar while ignoring a reply that arrives after the timeout.
+      try: (_signal) => evaluate(),
+      catch: (cause) => new PreviewOperationError({ ...errorContext, cause }),
+    }).pipe(
+      Effect.timeout(VIEWPORT_LAYOUT_METRICS_TIMEOUT_MS),
+      Effect.catchTags({
+        TimeoutError: (cause) => Effect.fail(new PreviewOperationError({ ...errorContext, cause })),
+      }),
+    );
   const capturePageWithRetry = Effect.fn("PreviewManager.capturePageWithRetry")(function* (
     errorContext: PreviewOperationContext,
     tabId: string,
@@ -1042,9 +1062,10 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     if (!tab || tab.webContentsId == null) return;
     const wc = webContents.fromId(tab.webContentsId);
     if (!wc || wc.isDestroyed()) return;
-    yield* attempt({ operation: "assertTabZoom", tabId, webContentsId: wc.id }, () =>
-      wc.setZoomFactor(tab.zoomFactor),
-    ).pipe(Effect.ignore);
+    yield* attempt({ operation: "assertTabZoom", tabId, webContentsId: wc.id }, () => {
+      wc.setZoomFactor(tab.zoomFactor);
+      invalidateViewportCalibration(wc);
+    }).pipe(Effect.ignore);
   });
 
   /**
@@ -1541,7 +1562,9 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       const send: SendCommand = Effect.fn("PreviewManager.sendCommand")(
         function* (method, commandParams, sessionId) {
           yield* checkControl;
-          const result = yield* attemptPromise(
+          const attemptCommand =
+            method === "Page.getLayoutMetrics" ? attemptViewportLayoutMetrics : attemptPromise;
+          const result = yield* attemptCommand(
             { operation: `${action}.${method}`, tabId, webContentsId: wc.id },
             () =>
               sessionId === undefined
@@ -1835,6 +1858,10 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           }
         }),
       );
+    const restoreViewportAfterNavigation = () => {
+      restoreRecordingCursor();
+      return runFork(assertTabZoom(tabId).pipe(Effect.andThen(reapplyViewport(tabId))));
+    };
     const navigationStarted = (
       event: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
     ) => {
@@ -2060,7 +2087,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         wc.off("page-favicon-updated", faviconUpdated as never);
         wc.off("did-start-loading", sync);
         wc.off("did-stop-loading", sync);
-        wc.off("dom-ready", restoreRecordingCursor);
+        wc.off("dom-ready", restoreViewportAfterNavigation);
         wc.off("did-fail-load", failed as never);
         wc.off("audio-state-changed", audioStateChanged);
         wc.off("did-create-window", windowCreated);
@@ -2082,7 +2109,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         wc.on("page-favicon-updated", faviconUpdated as never);
         wc.on("did-start-loading", sync);
         wc.on("did-stop-loading", sync);
-        wc.on("dom-ready", restoreRecordingCursor);
+        wc.on("dom-ready", restoreViewportAfterNavigation);
         wc.on("did-fail-load", failed as never);
         wc.on("audio-state-changed", audioStateChanged);
         wc.ipc.on(HUMAN_INPUT_CHANNEL, humanInput);
@@ -2298,6 +2325,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       // changed. Only push its zoom back down — Chromium may have just handed
       // this guest the app window's zoom level.
       yield* assertTabZoom(tabId);
+      runFork(reapplyViewport(tabId));
       yield* attempt({ operation: "registerWebview.sendTheme", tabId, webContentsId }, () =>
         wc.send(ANNOTATION_THEME_CHANNEL, annotationTheme),
       );
@@ -2760,8 +2788,23 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
    */
   const reapplyZoom = Effect.fn("PreviewManager.reapplyZoom")(function* () {
     const tabIds = Array.from((yield* SynchronizedRef.get(tabsRef)).keys());
-    yield* Effect.forEach(tabIds, assertTabZoom, { discard: true });
+    yield* Effect.forEach(
+      tabIds,
+      (tabId) => assertTabZoom(tabId).pipe(Effect.andThen(reapplyViewport(tabId))),
+      { discard: true },
+    );
   });
+
+  const reapplyViewport = (tabId: string) =>
+    Effect.gen(function* () {
+      if (!(yield* SynchronizedRef.get(viewportOverridesRef)).has(tabId)) return;
+      const generation = tabLifecycleGenerations.get(tabId);
+      const target = yield* currentViewportTarget(tabId, generation);
+      if (!target.intent) return;
+      yield* settleViewportIntent(tabId, target.wc, target.intent, generation, (input) =>
+        applyViewportOverride(tabId, target.wc, input),
+      );
+    }).pipe(Effect.ignore);
 
   const applyZoom = Effect.fn("PreviewManager.applyZoom")(function* (
     tabId: string,
@@ -2774,12 +2817,15 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     if (tab.webContentsId != null) {
       const wc = webContents.fromId(tab.webContentsId);
       if (wc && !wc.isDestroyed()) {
-        yield* attempt({ operation: "applyZoom", tabId, webContentsId: wc.id }, () =>
-          wc.setZoomFactor(next),
-        );
+        yield* attempt({ operation: "applyZoom", tabId, webContentsId: wc.id }, () => {
+          wc.setZoomFactor(next);
+          invalidateViewportCalibration(wc);
+        });
       }
     }
     yield* update(tabId, { zoomFactor: next });
+    yield* assertTabZoom(tabId);
+    yield* reapplyViewport(tabId);
   });
 
   // Emulated media lives on the CDP debugger session, not the WebContents, so
@@ -2899,19 +2945,47 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     );
   });
 
-  const deviceMetricsOverride = (input: { readonly width: number; readonly height: number }) =>
-    Effect.succeed({
-      // CDP overrides the guest CSS viewport directly, including at fractional
-      // zoom. Multiplying by the stored zoom changes window.innerWidth again.
-      width: input.width,
-      height: input.height,
+  const deviceMetricsOverride = Effect.fnUntraced(function* (
+    input: { readonly width: number; readonly height: number },
+    send: SendCommand,
+  ) {
+    const layout = yield* send("Page.getLayoutMetrics");
+    const zoom = yield* attempt({ operation: "deviceMetricsOverride.readZoom" }, () => {
+      const viewport =
+        typeof layout === "object" && layout !== null
+          ? "cssVisualViewport" in layout
+            ? layout.cssVisualViewport
+            : "visualViewport" in layout
+              ? layout.visualViewport
+              : undefined
+          : undefined;
+      // VisualViewport.zoom is optional in CDP. A missing value means there
+      // is no reported page-zoom conversion; never substitute inherited zoom.
+      const effectiveZoom =
+        typeof viewport === "object" && viewport !== null && "zoom" in viewport ? viewport.zoom : 1;
+      if (
+        typeof effectiveZoom !== "number" ||
+        !Number.isFinite(effectiveZoom) ||
+        effectiveZoom <= 0
+      ) {
+        throw new Error("Guest reported an invalid page zoom factor");
+      }
+      return effectiveZoom;
+    });
+    return {
+      // Device metrics use DIP, while the requested viewport uses CSS pixels.
+      // CDP reports the current document's conversion: about:blank may remain
+      // at effective zoom 1 even when Electron's getZoomFactor reports 0.8.
+      width: Math.max(1, Math.round(input.width * zoom)),
+      height: Math.max(1, Math.round(input.height * zoom)),
       // Zero leaves Chromium's current device scale factor unchanged.
       deviceScaleFactor: 0,
       // A fixed CSS viewport is not full mobile-device emulation. Setting this
       // true also changes Chromium's layout viewport when the page has no
       // viewport meta tag.
       mobile: false,
-    });
+    };
+  });
 
   const rememberViewportOverride = (tabId: string, input: PreviewViewportOverride) =>
     SynchronizedRef.modify(viewportOverridesRef, (overrides) => {
@@ -2972,18 +3046,26 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   ) {
     yield* checkControl;
     yield* ensureControlSession(wc);
-    yield* checkControl;
-    if ("clear" in input) {
-      yield* attemptPromise(
+    const send: SendCommand = Effect.fnUntraced(function* (method, params) {
+      yield* checkControl;
+      const attemptCommand =
+        method === "Page.getLayoutMetrics" ? attemptViewportLayoutMetrics : attemptPromise;
+      const result = yield* attemptCommand(
         { operation: "applyViewportOverride", tabId, webContentsId: wc.id },
-        () => wc.debugger.sendCommand("Emulation.clearDeviceMetricsOverride"),
+        () =>
+          params === undefined
+            ? wc.debugger.sendCommand(method)
+            : wc.debugger.sendCommand(method, params),
       );
+      yield* checkControl;
+      return result;
+    });
+    if ("clear" in input) {
+      yield* send("Emulation.clearDeviceMetricsOverride");
       return;
     }
-    const metrics = yield* deviceMetricsOverride(input);
-    yield* attemptPromise({ operation: "applyViewportOverride", tabId, webContentsId: wc.id }, () =>
-      wc.debugger.sendCommand("Emulation.setDeviceMetricsOverride", metrics),
-    );
+    const metrics = yield* deviceMetricsOverride(input, send);
+    yield* send("Emulation.setDeviceMetricsOverride", metrics);
   });
 
   const reconcileViewportRollback = Effect.fnUntraced(function* (
@@ -2992,6 +3074,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   ) {
     let applied: PreviewViewportIntent | undefined;
     let appliedWebContents: Electron.WebContents | undefined;
+    let appliedCalibrationVersion: number | undefined;
     while (true) {
       if (
         tabLifecycleGenerations.get(tabId) !== generation ||
@@ -3004,10 +3087,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       if (!current || current.webContentsId == null) return;
       const currentWebContents = webContents.fromId(current.webContentsId);
       if (!currentWebContents || currentWebContents.isDestroyed()) return;
-      if (latest === applied && currentWebContents === appliedWebContents) return;
+      const calibrationVersion = viewportCalibrationVersions.get(currentWebContents) ?? 0;
+      if (
+        latest === applied &&
+        currentWebContents === appliedWebContents &&
+        calibrationVersion === appliedCalibrationVersion
+      )
+        return;
       yield* applyViewportOverride(tabId, currentWebContents, latest?.input ?? { clear: true });
       applied = latest;
       appliedWebContents = currentWebContents;
+      appliedCalibrationVersion = calibrationVersion;
     }
   });
 
@@ -3043,6 +3133,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     return {
       intent: (yield* SynchronizedRef.get(viewportOverridesRef)).get(tabId),
       wc: currentWebContents,
+      calibrationVersion: viewportCalibrationVersions.get(currentWebContents) ?? 0,
     };
   });
 
@@ -3055,6 +3146,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     checkControl: Effect.Effect<void, PreviewManagerError> = Effect.void,
   ) {
     yield* checkControl;
+    const initialTarget = yield* currentViewportTarget(tabId, generation);
     const initialExit = yield* Effect.exit(applyInitial(intent.input));
     yield* checkControl;
     if (Exit.isFailure(initialExit)) {
@@ -3066,11 +3158,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
 
     let applied = Exit.isSuccess(initialExit) ? intent : undefined;
     let appliedWebContents = Exit.isSuccess(initialExit) ? wc : undefined;
+    let appliedCalibrationVersion = initialTarget.calibrationVersion;
     while (true) {
       yield* checkControl;
       const current = yield* currentViewportTarget(tabId, generation);
       yield* checkControl;
-      if (current.intent === applied && current.wc === appliedWebContents) return;
+      if (
+        current.intent === applied &&
+        current.wc === appliedWebContents &&
+        current.calibrationVersion === appliedCalibrationVersion
+      )
+        return;
 
       const applyExit = yield* Effect.exit(
         applyViewportOverride(
@@ -3090,6 +3188,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       }
       applied = current.intent;
       appliedWebContents = current.wc;
+      appliedCalibrationVersion = current.calibrationVersion;
     }
   });
 
@@ -3128,7 +3227,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           if ("clear" in latest) {
             return send("Emulation.clearDeviceMetricsOverride").pipe(Effect.asVoid);
           }
-          return deviceMetricsOverride(latest).pipe(
+          return deviceMetricsOverride(latest, send).pipe(
             Effect.flatMap((metrics) => send("Emulation.setDeviceMetricsOverride", metrics)),
             Effect.asVoid,
           );

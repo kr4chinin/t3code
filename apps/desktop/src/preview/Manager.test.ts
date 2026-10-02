@@ -2415,32 +2415,66 @@ describe("PreviewManager", () => {
       ),
   );
 
-  effectIt.effect("keeps logical viewport sizes unchanged at each supported test zoom", () =>
+  effectIt.effect("converts logical viewport sizes using effective document zoom", () =>
     withManager((manager) =>
       Effect.gen(function* () {
         const cases = [
-          { tabId: "tab_zoom_50", webContentsId: 50, zoomFactor: 0.5, width: 1024, height: 768 },
-          { tabId: "tab_zoom_80", webContentsId: 80, zoomFactor: 0.8, width: 1024, height: 768 },
-          { tabId: "tab_zoom_100", webContentsId: 100, zoomFactor: 1, width: 1024, height: 768 },
+          {
+            tabId: "tab_zoom_50",
+            webContentsId: 50,
+            zoomFactor: 0.5,
+            effectiveZoom: 0.5,
+            width: 512,
+            height: 384,
+          },
+          {
+            tabId: "tab_zoom_80",
+            webContentsId: 80,
+            zoomFactor: 0.8,
+            effectiveZoom: 0.8,
+            width: 819,
+            height: 614,
+          },
+          {
+            tabId: "tab_zoom_blank",
+            webContentsId: 81,
+            zoomFactor: 0.8,
+            effectiveZoom: 1,
+            width: 1024,
+            height: 768,
+          },
+          {
+            tabId: "tab_zoom_100",
+            webContentsId: 100,
+            zoomFactor: 1,
+            effectiveZoom: 1,
+            width: 1024,
+            height: 768,
+          },
           {
             tabId: "tab_zoom_125",
             webContentsId: 125,
             zoomFactor: 1.25,
-            width: 1024,
-            height: 768,
+            effectiveZoom: 1.25,
+            width: 1280,
+            height: 960,
           },
         ] as const;
         const commandsById = new Map(
           cases.map(
-            ({ webContentsId }) =>
+            ({ webContentsId, effectiveZoom }) =>
               [
                 webContentsId,
-                vi.fn(async (_method: string, _params?: Record<string, unknown>) => undefined),
+                vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+                  method === "Page.getLayoutMetrics"
+                    ? { cssVisualViewport: { zoom: effectiveZoom } }
+                    : undefined,
+                ),
               ] as const,
           ),
         );
         const webContentsById = new Map<number, unknown>();
-        for (const { webContentsId } of cases) {
+        for (const { webContentsId, zoomFactor } of cases) {
           webContentsById.set(webContentsId, {
             id: webContentsId,
             isDestroyed: () => false,
@@ -2449,7 +2483,7 @@ describe("PreviewManager", () => {
             getURL: () => "https://example.com",
             getTitle: () => "Example",
             isLoading: () => false,
-            getZoomFactor: () => 1,
+            getZoomFactor: () => zoomFactor,
             setZoomFactor: vi.fn(),
             setAudioMuted: vi.fn(),
             isCurrentlyAudible: () => false,
@@ -2494,6 +2528,293 @@ describe("PreviewManager", () => {
             expect(call).toEqual(expectedCall);
           }
         }
+      }),
+    ),
+  );
+
+  effectIt.effect(
+    "reapplies logical viewport sizes after zoom changes and keeps fill cleared",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          let zoom = 1;
+          const sendCommand = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+            method === "Page.getLayoutMetrics" ? { cssVisualViewport: { zoom } } : undefined,
+          );
+          const wc = makeViewportWebContents(42, sendCommand);
+          Object.assign(wc, {
+            getZoomFactor: () => zoom,
+            setZoomFactor: vi.fn((next: number) => {
+              zoom = next;
+            }),
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("tab_viewport_zoom_changes");
+          yield* manager.registerWebview("tab_viewport_zoom_changes", 42);
+          yield* manager.setViewport("tab_viewport_zoom_changes", { width: 390, height: 844 });
+          yield* manager.zoomOut("tab_viewport_zoom_changes");
+          yield* manager.zoomOut("tab_viewport_zoom_changes");
+          expect(sendCommand).toHaveBeenLastCalledWith(
+            "Emulation.setDeviceMetricsOverride",
+            expect.objectContaining({ width: 312, height: 675 }),
+          );
+          zoom = 1.25;
+          yield* manager.reapplyZoom();
+          expect(zoom).toBe(0.8);
+          expect(sendCommand).toHaveBeenLastCalledWith(
+            "Emulation.setDeviceMetricsOverride",
+            expect.objectContaining({ width: 312, height: 675 }),
+          );
+          yield* manager.resetZoom("tab_viewport_zoom_changes");
+          expect(sendCommand).toHaveBeenLastCalledWith(
+            "Emulation.setDeviceMetricsOverride",
+            expect.objectContaining({ width: 390, height: 844 }),
+          );
+          yield* manager.setViewport("tab_viewport_zoom_changes", { clear: true });
+          sendCommand.mockClear();
+          yield* manager.zoomOut("tab_viewport_zoom_changes");
+          expect(
+            sendCommand.mock.calls.filter(([method]) => method.includes("DeviceMetricsOverride")),
+          ).toHaveLength(1);
+          expect(sendCommand).toHaveBeenLastCalledWith("Emulation.clearDeviceMetricsOverride");
+        }),
+      ),
+  );
+
+  effectIt.effect("recalibrates an existing viewport when the next document becomes ready", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        let effectiveZoom = 1;
+        let onDomReady: (() => void) | undefined;
+        const reapplyFinished = Promise.withResolvers<void>();
+        const sendCommand = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+          if (method === "Page.getLayoutMetrics")
+            return { cssVisualViewport: { zoom: effectiveZoom } };
+          if (method === "Emulation.setDeviceMetricsOverride" && params?.width === 312)
+            reapplyFinished.resolve();
+        });
+        const wc = makeViewportWebContents(42, sendCommand);
+        Object.assign(wc, {
+          getZoomFactor: () => 0.8,
+          on: vi.fn((event: string, listener: () => void) => {
+            if (event === "dom-ready") onDomReady = listener;
+          }),
+        });
+        fromId.mockReturnValue(wc);
+        yield* manager.createTab("tab_viewport_navigation_zoom", { zoomFactor: 0.8 });
+        yield* manager.registerWebview("tab_viewport_navigation_zoom", 42);
+        yield* manager.setViewport("tab_viewport_navigation_zoom", { width: 390, height: 844 });
+        expect(sendCommand).toHaveBeenLastCalledWith(
+          "Emulation.setDeviceMetricsOverride",
+          expect.objectContaining({ width: 390, height: 844 }),
+        );
+        effectiveZoom = 0.8;
+        expect(onDomReady).toBeDefined();
+        onDomReady?.();
+        yield* Effect.promise(() => reapplyFinished.promise);
+        expect(sendCommand).toHaveBeenLastCalledWith(
+          "Emulation.setDeviceMetricsOverride",
+          expect.objectContaining({ width: 312, height: 675 }),
+        );
+      }),
+    ),
+  );
+
+  for (const mediaOutcome of ["stalls", "rejects"] as const) {
+    effectIt.effect(
+      `reapplies a dark-scheme viewport even if media restoration ${mediaOutcome}`,
+      () =>
+        withManager((manager) =>
+          Effect.gen(function* () {
+            let zoom = 1;
+            let observeZoom = false;
+            const firstZoomCommand = Promise.withResolvers<"media" | "viewport">();
+            const releaseMedia = Promise.withResolvers<void>();
+            const sendCommand = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+              if (method === "Page.getLayoutMetrics") return { cssVisualViewport: { zoom } };
+              if (!observeZoom) return;
+              if (method === "Emulation.setEmulatedMedia") {
+                firstZoomCommand.resolve("media");
+                if (mediaOutcome === "rejects") throw new Error("media restoration rejected");
+                await releaseMedia.promise;
+              } else if (method === "Emulation.setDeviceMetricsOverride") {
+                firstZoomCommand.resolve("viewport");
+              }
+            });
+            const wc = makeViewportWebContents(42, sendCommand);
+            Object.assign(wc, {
+              setZoomFactor: vi.fn((next: number) => {
+                zoom = next;
+              }),
+            });
+            fromId.mockReturnValue(wc);
+            yield* manager.createTab("tab_viewport_dark_zoom");
+            yield* manager.registerWebview("tab_viewport_dark_zoom", 42);
+            yield* Effect.yieldNow;
+            yield* manager.setColorScheme("tab_viewport_dark_zoom", "dark");
+            yield* manager.setViewport("tab_viewport_dark_zoom", { width: 390, height: 844 });
+            observeZoom = true;
+            const zoomOut = yield* manager
+              .zoomOut("tab_viewport_dark_zoom")
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            const firstCommand = yield* Effect.promise(() => firstZoomCommand.promise);
+            releaseMedia.resolve();
+            yield* Fiber.join(zoomOut);
+            expect(firstCommand).toBe("viewport");
+            expect(
+              sendCommand.mock.calls.filter(([method]) => method === "Emulation.setEmulatedMedia"),
+            ).toHaveLength(1);
+            expect(sendCommand).toHaveBeenLastCalledWith(
+              "Emulation.setDeviceMetricsOverride",
+              expect.objectContaining({ width: 351, height: 760 }),
+            );
+          }),
+        ),
+    );
+  }
+
+  effectIt.effect("reconciles a stale metric reply after a newer zoom change", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        let zoom = 1;
+        let holdInitialQuery = true;
+        const queryStarted = Promise.withResolvers<void>();
+        const releaseQuery = Promise.withResolvers<void>();
+        const sendCommand = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+          if (method !== "Page.getLayoutMetrics") return;
+          const measuredZoom = zoom;
+          if (holdInitialQuery) {
+            holdInitialQuery = false;
+            queryStarted.resolve();
+            await releaseQuery.promise;
+          }
+          return { cssVisualViewport: { zoom: measuredZoom } };
+        });
+        const wc = makeViewportWebContents(42, sendCommand);
+        Object.assign(wc, {
+          setZoomFactor: vi.fn((next: number) => {
+            zoom = next;
+          }),
+        });
+        fromId.mockReturnValue(wc);
+        yield* manager.createTab("tab_viewport_zoom_race");
+        yield* manager.registerWebview("tab_viewport_zoom_race", 42);
+        yield* Effect.yieldNow;
+        const resize = yield* manager
+          .automationSetViewport("tab_viewport_zoom_race", { width: 390, height: 844 })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.promise(() => queryStarted.promise);
+        yield* manager.zoomOut("tab_viewport_zoom_race");
+        yield* manager.zoomOut("tab_viewport_zoom_race");
+        releaseQuery.resolve();
+        yield* Fiber.join(resize);
+        expect(sendCommand).toHaveBeenLastCalledWith(
+          "Emulation.setDeviceMetricsOverride",
+          expect.objectContaining({ width: 312, height: 675 }),
+        );
+      }),
+    ),
+  );
+
+  effectIt.effect("times out a stalled metric query without applying its late reply", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const queryStarted = Promise.withResolvers<void>();
+        const releaseQuery = Promise.withResolvers<unknown>();
+        let holdQuery = true;
+        const sendCommand = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
+          if (method !== "Page.getLayoutMetrics") return;
+          if (holdQuery) {
+            holdQuery = false;
+            queryStarted.resolve();
+            return releaseQuery.promise;
+          }
+          return { cssVisualViewport: { zoom: 1 } };
+        });
+        fromId.mockReturnValue(makeViewportWebContents(42, sendCommand));
+        yield* manager.createTab("tab_viewport_metric_timeout");
+        yield* manager.registerWebview("tab_viewport_metric_timeout", 42);
+        yield* Effect.yieldNow;
+        const resize = yield* manager
+          .automationSetViewport("tab_viewport_metric_timeout", { width: 390, height: 844 })
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Effect.promise(() => queryStarted.promise);
+        yield* TestClock.adjust(2_000);
+        const exit = yield* Fiber.await(resize);
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isSuccess(exit)) return;
+        expect(Option.getOrThrow(Cause.findErrorOption(exit.cause))).toMatchObject({
+          _tag: "PreviewOperationError",
+          operation: "resize.Page.getLayoutMetrics",
+        });
+        expect(
+          sendCommand.mock.calls.filter(
+            ([method]) => method === "Emulation.setDeviceMetricsOverride",
+          ),
+        ).toHaveLength(0);
+        releaseQuery.resolve({ cssVisualViewport: { zoom: 0.8 } });
+        yield* Effect.yieldNow;
+        expect(
+          sendCommand.mock.calls.filter(
+            ([method]) => method === "Emulation.setDeviceMetricsOverride",
+          ),
+        ).toHaveLength(0);
+        yield* manager.automationSetViewport("tab_viewport_metric_timeout", {
+          width: 844,
+          height: 390,
+        });
+        expect(sendCommand).toHaveBeenLastCalledWith(
+          "Emulation.setDeviceMetricsOverride",
+          expect.objectContaining({ width: 844, height: 390 }),
+        );
+      }),
+    ),
+  );
+
+  for (const zoom of [0, -1, NaN, Infinity, "0.8"] as const) {
+    effectIt.effect(`rejects an invalid effective document zoom ${String(zoom)}`, () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const sendCommand = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+            method === "Page.getLayoutMetrics" ? { cssVisualViewport: { zoom } } : undefined,
+          );
+          fromId.mockReturnValue(makeViewportWebContents(42, sendCommand));
+          yield* manager.createTab("tab_viewport_invalid_zoom");
+          yield* manager.registerWebview("tab_viewport_invalid_zoom", 42);
+          const exit = yield* manager
+            .automationSetViewport("tab_viewport_invalid_zoom", { width: 390, height: 844 })
+            .pipe(Effect.exit);
+          expect(Exit.isFailure(exit)).toBe(true);
+          expect(
+            sendCommand.mock.calls.filter(
+              ([method]) => method === "Emulation.setDeviceMetricsOverride",
+            ),
+          ).toHaveLength(0);
+          expect(sendCommand).toHaveBeenLastCalledWith("Emulation.clearDeviceMetricsOverride");
+        }),
+      ),
+    );
+  }
+
+  effectIt.effect("uses unzoomed metrics when CDP omits its optional zoom field", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const sendCommand = vi.fn(async (method: string, _params?: Record<string, unknown>) =>
+          method === "Page.getLayoutMetrics" ? { cssVisualViewport: {} } : undefined,
+        );
+        const wc = makeViewportWebContents(42, sendCommand);
+        Object.assign(wc, { getZoomFactor: () => 0.8 });
+        fromId.mockReturnValue(wc);
+        yield* manager.createTab("tab_viewport_missing_zoom", { zoomFactor: 0.8 });
+        yield* manager.registerWebview("tab_viewport_missing_zoom", 42);
+        yield* manager.automationSetViewport("tab_viewport_missing_zoom", {
+          width: 390,
+          height: 844,
+        });
+        expect(sendCommand).toHaveBeenLastCalledWith(
+          "Emulation.setDeviceMetricsOverride",
+          expect.objectContaining({ width: 390, height: 844 }),
+        );
       }),
     ),
   );

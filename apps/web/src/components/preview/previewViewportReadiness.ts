@@ -27,9 +27,9 @@ export function isPreviewViewportReady(input: {
     return false;
   }
 
-  // Electron rounds CSS pixels through the guest's fractional zoom/device scale,
-  // so a successfully applied fixed viewport can measure one pixel either way.
-  const tolerance = 1;
+  // CDP fixed dimensions are integer DIP. At the supported minimum page zoom
+  // of 0.25, half a DIP becomes two CSS pixels. Fill has no metrics conversion.
+  const tolerance = setting._tag === "fill" ? 1 : 2;
   return (
     Math.abs(renderedViewport.width - expectedViewport.width) <= tolerance &&
     Math.abs(renderedViewport.height - expectedViewport.height) <= tolerance
