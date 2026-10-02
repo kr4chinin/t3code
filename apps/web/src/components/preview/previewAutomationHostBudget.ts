@@ -3,6 +3,22 @@ export const PREVIEW_HOST_RESPONSE_MARGIN_MS = 1_500;
 
 const HOST_RESPONSE_MARGIN_FRACTION = 0.2;
 
+export function runBeforeDeadline<A>(
+  deadlineAt: number,
+  operation: () => Promise<A>,
+  timeoutError: () => Error,
+): Promise<A> {
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) return Promise.reject(timeoutError());
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => reject(timeoutError()), remainingMs);
+  });
+  return Promise.race([Promise.resolve().then(operation), timeout]).finally(() => {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  });
+}
+
 export function resolveHostWaitBudgetMs(requestTimeoutMs: number): number {
   if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
     return 0;

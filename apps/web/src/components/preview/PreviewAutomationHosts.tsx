@@ -38,6 +38,7 @@ import {
   usePreviewMiniPlayerStore,
 } from "~/previewMiniPlayerStore";
 import { resolveBrowserNavigationTarget } from "~/browser/browserTargetResolver";
+import { browserViewportSettingKey } from "~/browser/browserViewportLayout";
 import {
   readActiveBrowserRecordingTargets,
   startBrowserRecording,
@@ -64,6 +65,7 @@ import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import { useAtomCommand } from "~/state/use-atom-command";
 
 import { previewBridge } from "./previewBridge";
+import { applyPreviewGuestViewport } from "./previewGuestViewport";
 import {
   PreviewAutomationOperationError,
   PreviewAutomationOverlayTimeoutError,
@@ -89,9 +91,17 @@ import {
   resolvePreviewAutomationOpenTab,
   resolvePreviewAutomationTarget,
 } from "./previewAutomationTarget";
-import { resolveHostWaitBudgetMs, waitForHostReadiness } from "./previewAutomationHostBudget";
+import {
+  resolveHostWaitBudgetMs,
+  runBeforeDeadline,
+  waitForHostReadiness,
+} from "./previewAutomationHostBudget";
 import { isPreviewViewportReady } from "./previewViewportReadiness";
-import { shouldRollbackPreviewViewport } from "./previewViewportRollback";
+import {
+  applyPreviewViewportRollback,
+  createPreviewViewportRollbackState,
+  type PreviewViewportRollbackState,
+} from "./previewViewportRollback";
 
 const PREVIEW_PRESENTATION_SETTLE_TIMEOUT_MS = 500;
 
@@ -187,6 +197,7 @@ const waitForRenderedViewport = async (
   tabId: string,
   runtimeTabId: string,
   setting: PreviewViewportSetting,
+  deadlineAt: number,
   timeoutMs: number,
   context: {
     readonly requestId: PreviewAutomationRequest["requestId"];
@@ -195,8 +206,7 @@ const waitForRenderedViewport = async (
     readonly threadId: PreviewAutomationRequest["threadId"];
   },
 ): Promise<PreviewRenderedViewportSize> => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
+  while (Date.now() <= deadlineAt) {
     assertPreviewRuntimeCurrent(threadRef, tabId, runtimeTabId, context);
     try {
       const webview = findPreviewWebview(runtimeTabId);
@@ -595,81 +605,158 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
             const ready = await requireReadyTab();
             const input = request.input as PreviewAutomationResizeInput;
             const setting = resolvePreviewViewport(input);
-            const applied = await runBrowserViewportMutation(ready.runtimeTabId, async () => {
-              const operationState = assertPreviewRuntimeCurrent(
+            const timeoutMs = input.timeoutMs ?? request.timeoutMs;
+            const deadlineAt = Math.min(hostDeadlineMs, Date.now() + timeoutMs);
+            const timeoutError = () =>
+              new PreviewAutomationViewportTimeoutError({
+                requestId: request.requestId,
+                environmentId,
+                threadId: request.threadId,
+                tabId: ready.tabId,
+                timeoutMs,
+              });
+            const rollbackViewportIfCurrent = async (
+              rollbackState: PreviewViewportRollbackState,
+            ) => {
+              const { previousSetting } = rollbackState;
+              try {
+                assertPreviewRuntimeCurrent(threadRef, ready.tabId, ready.runtimeTabId, request);
+              } catch {
+                return;
+              }
+              await applyPreviewViewportRollback({
+                previous: previousSetting,
+                // This direct path bypasses the agent-control semaphore and
+                // supersedes any stuck automation CDP command.
+                applyGuest: (viewport) =>
+                  applyPreviewGuestViewport(ready.bridge.setViewport, ready.runtimeTabId, viewport),
+                rollbackServer: async () => {
+                  const rollback = await resize({
+                    environmentId,
+                    input: rollbackState.input,
+                  });
+                  if (rollback._tag === "Failure") return false;
+                  updatePreviewServerSnapshot(threadRef, rollback.value);
+                  const rollbackVersion = rollback.value.stateVersion;
+                  const currentState = readThreadPreviewState(threadRef);
+                  const currentViewport =
+                    currentState.sessions[ready.tabId]?.viewport ?? FILL_PREVIEW_VIEWPORT;
+                  return (
+                    rollbackVersion !== undefined &&
+                    currentState.serverEpoch === rollbackVersion.serverEpoch &&
+                    currentState.serverRevisionByTabId[ready.tabId] === rollbackVersion.revision &&
+                    browserViewportSettingKey(currentViewport) ===
+                      browserViewportSettingKey(previousSetting)
+                  );
+                },
+              });
+            };
+            type RollbackState = PreviewViewportRollbackState | undefined;
+            let resolveRollbackState = (_state: RollbackState): void => undefined;
+            const rollbackStateReady = new Promise<RollbackState>((resolve) => {
+              resolveRollbackState = resolve;
+            });
+            let persistenceStarted = false;
+            const persistViewport = async () => {
+              persistenceStarted = true;
+              try {
+                assertPreviewRuntimeCurrent(threadRef, ready.tabId, ready.runtimeTabId, request);
+                const result = await resize({
+                  environmentId,
+                  input: {
+                    threadId: request.threadId,
+                    tabId: ready.tabId,
+                    viewport: setting,
+                  },
+                });
+                if (result._tag === "Failure") {
+                  resolveRollbackState(undefined);
+                  return raiseAtomCommandFailure(result);
+                }
+                const applied = createPreviewViewportRollbackState({
+                  result: result.value,
+                  threadId: request.threadId,
+                  tabId: ready.tabId,
+                });
+                resolveRollbackState(applied);
+                if (Date.now() >= deadlineAt) throw timeoutError();
+                updatePreviewServerSnapshot(threadRef, result.value);
+                return applied;
+              } catch (error) {
+                resolveRollbackState(undefined);
+                throw error;
+              }
+            };
+            const mutationDeadline = { deadlineAt, timeoutError };
+            try {
+              await runBrowserViewportMutation(
+                ready.runtimeTabId,
+                persistViewport,
+                mutationDeadline,
+              );
+              const currentState = assertPreviewRuntimeCurrent(
                 threadRef,
                 ready.tabId,
                 ready.runtimeTabId,
                 request,
               );
-              const previousSetting =
-                operationState.sessions[ready.tabId]?.viewport ?? FILL_PREVIEW_VIEWPORT;
-              const result = await resize({
-                environmentId,
-                input: {
-                  threadId: request.threadId,
-                  tabId: ready.tabId,
-                  viewport: setting,
-                },
-              });
-              if (result._tag === "Failure") {
-                return raiseAtomCommandFailure(result);
-              }
-              updatePreviewServerSnapshot(threadRef, result.value);
-              return {
-                previousSetting,
-                serverEpoch: operationState.serverEpoch,
-              };
-            });
-            let viewport: PreviewRenderedViewportSize;
-            try {
-              viewport = await waitForRenderedViewport(
-                threadRef,
-                ready.tabId,
-                ready.runtimeTabId,
-                setting,
-                input.timeoutMs ?? request.timeoutMs,
-                {
-                  requestId: request.requestId,
-                  operation: request.operation,
-                  environmentId,
-                  threadId: request.threadId,
-                },
+              // The store contains either this response or a newer same-tab
+              // event. Always send that authoritative value to the guest.
+              const appliedSetting =
+                currentState.sessions[ready.tabId]?.viewport ?? FILL_PREVIEW_VIEWPORT;
+              // Native CDP can outlive the server request. Keep it outside the
+              // shared server-mutation queue so toolbar resizes can proceed.
+              await runBeforeDeadline(
+                deadlineAt,
+                () =>
+                  applyPreviewGuestViewport(
+                    ready.bridge.automation.setViewport,
+                    ready.runtimeTabId,
+                    appliedSetting,
+                  ),
+                timeoutError,
               );
-            } catch (cause) {
-              await runBrowserViewportMutation(ready.runtimeTabId, async () => {
-                const latestState = readThreadPreviewState(threadRef);
-                const latestSetting =
-                  latestState.sessions[ready.tabId]?.viewport ?? FILL_PREVIEW_VIEWPORT;
-                if (
-                  shouldRollbackPreviewViewport(
-                    applied.previousSetting,
-                    setting,
-                    latestSetting,
-                    applied.serverEpoch,
-                    latestState.serverEpoch,
-                  )
-                ) {
-                  const rollback = await resize({
-                    environmentId,
-                    input: {
+              const viewport = await runBeforeDeadline(
+                deadlineAt,
+                () =>
+                  waitForRenderedViewport(
+                    threadRef,
+                    ready.tabId,
+                    ready.runtimeTabId,
+                    appliedSetting,
+                    deadlineAt,
+                    timeoutMs,
+                    {
+                      requestId: request.requestId,
+                      operation: request.operation,
+                      environmentId,
                       threadId: request.threadId,
-                      tabId: ready.tabId,
-                      viewport: applied.previousSetting,
                     },
-                  });
-                  if (rollback._tag !== "Failure") {
-                    updatePreviewServerSnapshot(threadRef, rollback.value);
-                  }
-                }
-              });
+                  ),
+                timeoutError,
+              );
+              return {
+                tabId: ready.tabId,
+                setting: appliedSetting,
+                viewport,
+              } satisfies PreviewAutomationResizeResult;
+            } catch (cause) {
+              if (!persistenceStarted) resolveRollbackState(undefined);
+              void rollbackStateReady
+                .then((pendingRollback) => {
+                  if (!pendingRollback) return;
+                  return runBrowserViewportMutation(
+                    ready.runtimeTabId,
+                    () => rollbackViewportIfCurrent(pendingRollback),
+                    {
+                      deadlineAt: Date.now() + timeoutMs,
+                      timeoutError,
+                    },
+                  );
+                })
+                .catch(() => undefined);
               throw cause;
             }
-            return {
-              tabId: ready.tabId,
-              setting,
-              viewport,
-            } satisfies PreviewAutomationResizeResult;
           }
           case "setColorScheme": {
             const ready = await requireReadyTab();

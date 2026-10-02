@@ -21,6 +21,8 @@ import {
   type PreviewRefreshInput,
   type PreviewReportStatusInput,
   type PreviewResizeInput,
+  PreviewResizeConflictError,
+  type PreviewResizeResult,
   FILL_PREVIEW_VIEWPORT,
   PreviewSessionLookupError,
   type PreviewSessionSnapshot,
@@ -51,7 +53,7 @@ export class PreviewManager extends Context.Service<
     readonly reportStatus: (input: PreviewReportStatusInput) => Effect.Effect<void, PreviewError>;
     readonly resize: (
       input: PreviewResizeInput,
-    ) => Effect.Effect<PreviewSessionSnapshot, PreviewError>;
+    ) => Effect.Effect<PreviewResizeResult, PreviewError>;
     readonly refresh: (input: PreviewRefreshInput) => Effect.Effect<void, PreviewError>;
     readonly close: (input: PreviewCloseInput) => Effect.Effect<void, PreviewError>;
     readonly list: (input: PreviewListInput) => Effect.Effect<PreviewListResult>;
@@ -64,6 +66,7 @@ interface PreviewSessionState {
   readonly threadId: string;
   readonly tabId: string;
   readonly snapshot: PreviewSessionSnapshot;
+  readonly viewportRevision: number;
 }
 
 interface ManagerState {
@@ -178,6 +181,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
     tabId: string,
     mutator: (
       session: PreviewSessionState,
+      currentRevision: number,
     ) => Effect.Effect<{ next: PreviewSessionState; emit: PreviewEventDraft | null; result: R }, E>,
   ): Effect.Effect<R, E | PreviewSessionLookupError> => {
     type ModifyResult =
@@ -192,7 +196,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
           state,
         ] as readonly [ModifyResult, ManagerState]);
       }
-      return mutator(session).pipe(
+      return mutator(session, state.revision).pipe(
         Effect.flatMap(
           Effect.fn("PreviewManager.commitMutation")(function* ({ next, emit, result }) {
             const revision = emit ? state.revision + 1 : state.revision;
@@ -252,6 +256,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
             threadId: input.threadId,
             tabId,
             snapshot,
+            viewportRevision: revision,
           });
           yield* PubSub.publish(eventsPubSub, {
             type: "opened",
@@ -361,15 +366,38 @@ export const make = Effect.gen(function* PreviewManagerMake() {
       return yield* mutateExistingSession(
         input.threadId,
         input.tabId,
-        Effect.fn("PreviewManager.resizeSession")(function* (session) {
+        Effect.fn("PreviewManager.resizeSession")(function* (session, currentRevision) {
+          const actualStateVersion = {
+            serverEpoch,
+            revision: session.viewportRevision,
+          } as const;
+          if (
+            input.expectedStateVersion &&
+            (input.expectedStateVersion.serverEpoch !== actualStateVersion.serverEpoch ||
+              input.expectedStateVersion.revision !== actualStateVersion.revision)
+          ) {
+            return yield* new PreviewResizeConflictError({
+              threadId: input.threadId,
+              tabId: input.tabId,
+              expectedStateVersion: input.expectedStateVersion,
+              actualStateVersion,
+            });
+          }
           const updatedAt = yield* currentIsoTimestamp;
+          const revision = currentRevision + 1;
+          const previousViewport = session.snapshot.viewport ?? FILL_PREVIEW_VIEWPORT;
           const snapshot: PreviewSessionSnapshot = {
             ...session.snapshot,
             viewport: input.viewport,
             updatedAt,
           };
+          const result: PreviewResizeResult = {
+            ...snapshot,
+            stateVersion: { serverEpoch, revision },
+            previousViewport,
+          };
           return {
-            next: { ...session, snapshot },
+            next: { ...session, snapshot, viewportRevision: revision },
             emit: {
               type: "resized",
               threadId: session.threadId,
@@ -377,7 +405,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
               createdAt: snapshot.updatedAt,
               snapshot,
             },
-            result: snapshot,
+            result,
           };
         }),
       );

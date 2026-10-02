@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import {
   PREVIEW_HOST_RESPONSE_MARGIN_MS,
   resolveHostWaitBudgetMs,
+  runBeforeDeadline,
   waitForHostReadiness,
 } from "./previewAutomationHostBudget";
 
@@ -21,6 +22,59 @@ describe("resolveHostWaitBudgetMs", () => {
     for (const invalid of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(resolveHostWaitBudgetMs(invalid)).toBeGreaterThanOrEqual(0);
     }
+  });
+});
+
+describe("runBeforeDeadline", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("releases a stalled viewport probe at the deadline and ignores its late result", async () => {
+    let completeProbe!: (value: { width: number; height: number }) => void;
+    const timeoutError = new Error("Viewport timed out");
+    const result = runBeforeDeadline(
+      80,
+      () =>
+        new Promise<{ width: number; height: number }>((resolve) => {
+          completeProbe = resolve;
+        }),
+      () => timeoutError,
+    );
+    const failure = expect(result).rejects.toBe(timeoutError);
+
+    await vi.advanceTimersByTimeAsync(80);
+    await failure;
+    completeProbe({ width: 390, height: 844 });
+    await vi.runAllTimersAsync();
+    await expect(result).rejects.toBe(timeoutError);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not start work after the deadline", async () => {
+    const operation = vi.fn(async () => true);
+    const timeoutError = new Error("Viewport timed out");
+    await expect(runBeforeDeadline(0, operation, () => timeoutError)).rejects.toBe(timeoutError);
+    expect(operation).not.toHaveBeenCalled();
+  });
+
+  it("preserves an operation failure and removes its timeout", async () => {
+    const error = new Error("Guest was replaced");
+    await expect(
+      runBeforeDeadline(
+        80,
+        async () => {
+          throw error;
+        },
+        () => new Error("Timeout"),
+      ),
+    ).rejects.toBe(error);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
