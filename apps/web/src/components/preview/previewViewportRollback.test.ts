@@ -15,6 +15,7 @@ describe("preview viewport rollback", () => {
     const rollback = createPreviewViewportRollbackState({
       threadId: ThreadId.make("thread-1"),
       tabId: "tab-1",
+      previousSetting: { _tag: "fill" },
       result: {
         threadId: ThreadId.make("thread-1"),
         tabId: "tab-1",
@@ -41,7 +42,7 @@ describe("preview viewport rollback", () => {
     expect(rollback?.input.expectedStateVersion).toBe(stateVersion);
   });
 
-  it("skips rollback unless the server returns both write fields", () => {
+  it("keeps available server metadata and falls back to the local predecessor", () => {
     const result = {
       threadId: ThreadId.make("thread-1"),
       tabId: "tab-1",
@@ -55,14 +56,27 @@ describe("preview viewport rollback", () => {
       createPreviewViewportRollbackState({
         threadId: ThreadId.make("thread-1"),
         tabId: "tab-1",
+        previousSetting: { _tag: "fill" },
         result: resizeResult,
       });
 
-    expect(create(result)).toBeUndefined();
+    expect(create(result).input).toEqual({
+      threadId: ThreadId.make("thread-1"),
+      tabId: "tab-1",
+      viewport: { _tag: "fill" },
+    });
     expect(
       create({ ...result, stateVersion: { serverEpoch: "server-a", revision: 2 } }),
-    ).toBeUndefined();
-    expect(create({ ...result, previousViewport: { _tag: "fill" } })).toBeUndefined();
+    ).toMatchObject({
+      input: {
+        viewport: { _tag: "fill" },
+        expectedStateVersion: { serverEpoch: "server-a", revision: 2 },
+      },
+    });
+    const serverPrevious = { _tag: "freeform", width: 700, height: 500 } as const;
+    expect(create({ ...result, previousViewport: serverPrevious }).previousSetting).toEqual(
+      serverPrevious,
+    );
   });
 
   it("changes the guest only after the guarded server rollback succeeds", async () => {

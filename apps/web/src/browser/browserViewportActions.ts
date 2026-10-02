@@ -7,6 +7,14 @@ interface BrowserViewportMutationDeadline {
   readonly timeoutError: () => Error;
 }
 
+export interface BrowserViewportMutation {
+  readonly isCurrent: () => boolean;
+  readonly runIfCurrent: <A>(
+    mutation: () => Promise<A>,
+    deadline?: BrowserViewportMutationDeadline,
+  ) => Promise<A | undefined>;
+}
+
 export const BROWSER_VIEWPORT_COMMIT_TIMEOUT_MS = 15_000;
 
 class BrowserViewportCommitTimeoutError extends Error {
@@ -19,6 +27,23 @@ class BrowserViewportCommitTimeoutError extends Error {
 
 const handlers = new Map<string, BrowserViewportHandler>();
 const commitTails = new Map<string, Promise<void>>();
+const currentMutations = new Map<string, symbol>();
+
+const createBrowserViewportMutation = (tabId: string): BrowserViewportMutation => {
+  const token = Symbol();
+  const mutation: BrowserViewportMutation = {
+    isCurrent: () => currentMutations.get(tabId) === token,
+    runIfCurrent: (rollback, deadline) =>
+      queueBrowserViewportMutation(
+        tabId,
+        () => (mutation.isCurrent() ? rollback() : Promise.resolve(undefined)),
+        deadline,
+        mutation,
+      ).execution,
+  };
+  currentMutations.set(tabId, token);
+  return mutation;
+};
 
 const runOperationBeforeDeadline = <A>(
   operation: Promise<A>,
@@ -38,8 +63,9 @@ const runOperationBeforeDeadline = <A>(
 
 const queueBrowserViewportMutation = <A>(
   tabId: string,
-  start: () => Promise<A>,
+  start: (mutation: BrowserViewportMutation) => Promise<A>,
   deadline?: BrowserViewportMutationDeadline,
+  rollbackOf?: BrowserViewportMutation,
 ): {
   readonly started: Promise<{ readonly operation: Promise<A> }>;
   readonly execution: Promise<A>;
@@ -51,7 +77,7 @@ const queueBrowserViewportMutation = <A>(
       operation:
         deadline && Date.now() >= deadline.deadlineAt
           ? Promise.reject<A>(deadline.timeoutError())
-          : Promise.resolve().then(start),
+          : Promise.resolve().then(() => start(rollbackOf ?? createBrowserViewportMutation(tabId))),
     }));
   const operation = started.then(({ operation: startedOperation }) => startedOperation);
   const execution = deadline ? runOperationBeforeDeadline(operation, deadline) : operation;
@@ -78,7 +104,7 @@ const queueBrowserViewportMutation = <A>(
  */
 export function runBrowserViewportMutation<A>(
   tabId: string,
-  mutation: () => Promise<A>,
+  mutation: (context: BrowserViewportMutation) => Promise<A>,
   deadline?: BrowserViewportMutationDeadline,
 ): Promise<A> {
   return queueBrowserViewportMutation(tabId, mutation, deadline).execution;

@@ -2968,8 +2968,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     tabId: string,
     wc: Electron.WebContents,
     input: PreviewViewportOverride,
+    checkControl: Effect.Effect<void, PreviewManagerError> = Effect.void,
   ) {
+    yield* checkControl;
     yield* ensureControlSession(wc);
+    yield* checkControl;
     if ("clear" in input) {
       yield* attemptPromise(
         { operation: "applyViewportOverride", tabId, webContentsId: wc.id },
@@ -3049,8 +3052,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     intent: PreviewViewportIntent,
     generation: number | undefined,
     applyInitial: (input: PreviewViewportOverride) => Effect.Effect<void, PreviewManagerError>,
+    checkControl: Effect.Effect<void, PreviewManagerError> = Effect.void,
   ) {
+    yield* checkControl;
     const initialExit = yield* Effect.exit(applyInitial(intent.input));
+    yield* checkControl;
     if (Exit.isFailure(initialExit)) {
       const current = yield* currentViewportTarget(tabId, generation);
       if (current.intent !== intent || current.wc === wc) {
@@ -3061,12 +3067,20 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     let applied = Exit.isSuccess(initialExit) ? intent : undefined;
     let appliedWebContents = Exit.isSuccess(initialExit) ? wc : undefined;
     while (true) {
+      yield* checkControl;
       const current = yield* currentViewportTarget(tabId, generation);
+      yield* checkControl;
       if (current.intent === applied && current.wc === appliedWebContents) return;
 
       const applyExit = yield* Effect.exit(
-        applyViewportOverride(tabId, current.wc, current.intent?.input ?? { clear: true }),
+        applyViewportOverride(
+          tabId,
+          current.wc,
+          current.intent?.input ?? { clear: true },
+          checkControl,
+        ),
       );
+      yield* checkControl;
       if (Exit.isFailure(applyExit)) {
         const afterFailure = yield* currentViewportTarget(tabId, generation);
         if (afterFailure.intent !== current.intent || afterFailure.wc === current.wc) {
@@ -3102,16 +3116,25 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     input: PreviewViewportOverride,
   ) {
     const prepared = yield* prepareViewportIntent(tabId, input);
-    yield* withControlSession(tabId, prepared.wc, "resize", (send) =>
-      settleViewportIntent(tabId, prepared.wc, prepared.intent, prepared.generation, (latest) => {
-        if ("clear" in latest) {
-          return send("Emulation.clearDeviceMetricsOverride").pipe(Effect.asVoid);
-        }
-        return deviceMetricsOverride(latest).pipe(
-          Effect.flatMap((metrics) => send("Emulation.setDeviceMetricsOverride", metrics)),
-          Effect.asVoid,
-        );
-      }),
+    yield* withControlSession(tabId, prepared.wc, "resize", (send, _sendCleanup, checkControl) =>
+      // Replacement guests retain the original action's control epoch. A failed
+      // send must not turn human takeover into a fresh resize retry.
+      settleViewportIntent(
+        tabId,
+        prepared.wc,
+        prepared.intent,
+        prepared.generation,
+        (latest) => {
+          if ("clear" in latest) {
+            return send("Emulation.clearDeviceMetricsOverride").pipe(Effect.asVoid);
+          }
+          return deviceMetricsOverride(latest).pipe(
+            Effect.flatMap((metrics) => send("Emulation.setDeviceMetricsOverride", metrics)),
+            Effect.asVoid,
+          );
+        },
+        checkControl,
+      ),
     ).pipe(
       Effect.tap(() => acceptViewportOverride(prepared.intent)),
       Effect.onError(() => rollbackViewportOverride(tabId, prepared.intent, prepared.generation)),

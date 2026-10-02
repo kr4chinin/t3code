@@ -7,7 +7,7 @@ import type {
 
 export interface PreviewViewportRollbackState {
   readonly previousSetting: PreviewViewportSetting;
-  readonly stateVersion: PreviewStateVersion;
+  readonly stateVersion: PreviewStateVersion | undefined;
   readonly input: PreviewResizeInput;
 }
 
@@ -15,10 +15,10 @@ export function createPreviewViewportRollbackState(options: {
   readonly result: PreviewResizeResult;
   readonly threadId: PreviewResizeInput["threadId"];
   readonly tabId: PreviewResizeInput["tabId"];
-}): PreviewViewportRollbackState | undefined {
+  readonly previousSetting: PreviewViewportSetting;
+}): PreviewViewportRollbackState {
   const stateVersion = options.result.stateVersion;
-  const previousSetting = options.result.previousViewport;
-  if (!stateVersion || !previousSetting) return undefined;
+  const previousSetting = options.result.previousViewport ?? options.previousSetting;
   return {
     previousSetting,
     stateVersion,
@@ -26,7 +26,7 @@ export function createPreviewViewportRollbackState(options: {
       threadId: options.threadId,
       tabId: options.tabId,
       viewport: previousSetting,
-      expectedStateVersion: stateVersion,
+      ...(stateVersion ? { expectedStateVersion: stateVersion } : {}),
     },
   };
 }

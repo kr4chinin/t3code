@@ -56,7 +56,10 @@ import {
   browserDefaultOpenViewport,
   resolveBrowserDefaults,
 } from "~/browser/browserDefaults";
-import { runBrowserViewportMutation } from "~/browser/browserViewportActions";
+import {
+  runBrowserViewportMutation,
+  type BrowserViewportMutation,
+} from "~/browser/browserViewportActions";
 import { previewRuntimeTabId } from "~/browser/previewRuntimeTabId";
 import { isElectron } from "~/env";
 import { useEnvironments } from "~/state/environments";
@@ -615,10 +618,13 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 tabId: ready.tabId,
                 timeoutMs,
               });
+            let localPreviousSetting: PreviewViewportSetting | undefined;
             const rollbackViewportIfCurrent = async (
               rollbackState: PreviewViewportRollbackState,
+              mutation: BrowserViewportMutation,
             ) => {
               const { previousSetting } = rollbackState;
+              if (!rollbackState.stateVersion && !mutation.isCurrent()) return;
               try {
                 assertPreviewRuntimeCurrent(threadRef, ready.tabId, ready.runtimeTabId, request);
               } catch {
@@ -629,22 +635,52 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                 // This direct path bypasses the agent-control semaphore and
                 // supersedes any stuck automation CDP command.
                 applyGuest: (viewport) =>
-                  applyPreviewGuestViewport(ready.bridge.setViewport, ready.runtimeTabId, viewport),
+                  rollbackState.stateVersion || mutation.isCurrent()
+                    ? applyPreviewGuestViewport(
+                        ready.bridge.setViewport,
+                        ready.runtimeTabId,
+                        viewport,
+                      )
+                    : Promise.resolve(),
                 rollbackServer: async () => {
+                  if (!rollbackState.stateVersion) {
+                    // Older servers cannot compare revisions atomically. Only
+                    // compensate our latest local write while its setting is
+                    // still current; remote writers still need server CAS.
+                    const currentViewport =
+                      readThreadPreviewState(threadRef).sessions[ready.tabId]?.viewport;
+                    if (
+                      !currentViewport ||
+                      (browserViewportSettingKey(currentViewport) !==
+                        browserViewportSettingKey(setting) &&
+                        (!localPreviousSetting ||
+                          browserViewportSettingKey(currentViewport) !==
+                            browserViewportSettingKey(localPreviousSetting)))
+                    ) {
+                      return false;
+                    }
+                  }
                   const rollback = await resize({
                     environmentId,
                     input: rollbackState.input,
                   });
-                  if (rollback._tag === "Failure") return false;
+                  if (
+                    rollback._tag === "Failure" ||
+                    (!rollbackState.stateVersion && !mutation.isCurrent())
+                  ) {
+                    return false;
+                  }
+                  assertPreviewRuntimeCurrent(threadRef, ready.tabId, ready.runtimeTabId, request);
                   updatePreviewServerSnapshot(threadRef, rollback.value);
                   const rollbackVersion = rollback.value.stateVersion;
                   const currentState = readThreadPreviewState(threadRef);
                   const currentViewport =
                     currentState.sessions[ready.tabId]?.viewport ?? FILL_PREVIEW_VIEWPORT;
                   return (
-                    rollbackVersion !== undefined &&
-                    currentState.serverEpoch === rollbackVersion.serverEpoch &&
-                    currentState.serverRevisionByTabId[ready.tabId] === rollbackVersion.revision &&
+                    (rollbackVersion === undefined ||
+                      (currentState.serverEpoch === rollbackVersion.serverEpoch &&
+                        currentState.serverRevisionByTabId[ready.tabId] ===
+                          rollbackVersion.revision)) &&
                     browserViewportSettingKey(currentViewport) ===
                       browserViewportSettingKey(previousSetting)
                   );
@@ -657,10 +693,20 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
               resolveRollbackState = resolve;
             });
             let persistenceStarted = false;
-            const persistViewport = async () => {
+            let persistenceMutation: BrowserViewportMutation | undefined;
+            const persistViewport = async (mutation: BrowserViewportMutation) => {
               persistenceStarted = true;
+              persistenceMutation = mutation;
               try {
-                assertPreviewRuntimeCurrent(threadRef, ready.tabId, ready.runtimeTabId, request);
+                const currentState = assertPreviewRuntimeCurrent(
+                  threadRef,
+                  ready.tabId,
+                  ready.runtimeTabId,
+                  request,
+                );
+                const previousSetting =
+                  currentState.sessions[ready.tabId]?.viewport ?? FILL_PREVIEW_VIEWPORT;
+                localPreviousSetting = previousSetting;
                 const result = await resize({
                   environmentId,
                   input: {
@@ -677,9 +723,11 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
                   result: result.value,
                   threadId: request.threadId,
                   tabId: ready.tabId,
+                  previousSetting,
                 });
                 resolveRollbackState(applied);
                 if (Date.now() >= deadlineAt) throw timeoutError();
+                assertPreviewRuntimeCurrent(threadRef, ready.tabId, ready.runtimeTabId, request);
                 updatePreviewServerSnapshot(threadRef, result.value);
                 return applied;
               } catch (error) {
@@ -744,15 +792,15 @@ function PreviewAutomationHost(props: { readonly environmentId: EnvironmentId })
               if (!persistenceStarted) resolveRollbackState(undefined);
               void rollbackStateReady
                 .then((pendingRollback) => {
-                  if (!pendingRollback) return;
-                  return runBrowserViewportMutation(
-                    ready.runtimeTabId,
-                    () => rollbackViewportIfCurrent(pendingRollback),
-                    {
-                      deadlineAt: Date.now() + timeoutMs,
-                      timeoutError,
-                    },
-                  );
+                  if (!pendingRollback || !persistenceMutation) return;
+                  const mutation = persistenceMutation;
+                  const rollback = () => rollbackViewportIfCurrent(pendingRollback, mutation);
+                  const deadline = { deadlineAt: Date.now() + timeoutMs, timeoutError };
+                  // CAS owns modern writes even if a newer local attempt failed.
+                  // Versionless servers instead need local mutation ownership.
+                  return pendingRollback.stateVersion
+                    ? runBrowserViewportMutation(ready.runtimeTabId, rollback, deadline)
+                    : mutation.runIfCurrent(rollback, deadline);
                 })
                 .catch(() => undefined);
               throw cause;

@@ -2574,45 +2574,152 @@ describe("PreviewManager", () => {
     ),
   );
 
-  effectIt.effect("retries a viewport intent when its captured webview is replaced", () =>
-    withManager((manager) =>
-      Effect.gen(function* () {
-        const applyStarted = Promise.withResolvers<void>();
-        const releaseApply = Promise.withResolvers<void>();
-        const firstSendCommand = vi.fn(async (method: string) => {
-          if (method !== "Emulation.setDeviceMetricsOverride") return;
-          applyStarted.resolve();
-          await releaseApply.promise;
-          throw new Error("replaced guest rejected viewport");
-        });
-        const replacementSendCommand = vi.fn(
-          async (_method: string, _params?: Record<string, unknown>) => undefined,
-        );
-        const first = makeViewportWebContents(42, firstSendCommand);
-        const replacement = makeViewportWebContents(43, replacementSendCommand);
-        fromId.mockImplementation(
-          (id) => (id === 42 ? first : id === 43 ? replacement : null) as never,
-        );
+  for (const source of ["toolbar", "automation"] as const) {
+    effectIt.effect(
+      `retries a ${source} viewport intent when its captured webview is replaced`,
+      () =>
+        withManager((manager) =>
+          Effect.gen(function* () {
+            const applyStarted = Promise.withResolvers<void>();
+            const releaseApply = Promise.withResolvers<void>();
+            const firstSendCommand = vi.fn(async (method: string) => {
+              if (method !== "Emulation.setDeviceMetricsOverride") return;
+              applyStarted.resolve();
+              await releaseApply.promise;
+              throw new Error("replaced guest rejected viewport");
+            });
+            const replacementSendCommand = vi.fn(
+              async (_method: string, _params?: Record<string, unknown>) => undefined,
+            );
+            const first = makeViewportWebContents(42, firstSendCommand);
+            const replacement = makeViewportWebContents(43, replacementSendCommand);
+            fromId.mockImplementation(
+              (id) => (id === 42 ? first : id === 43 ? replacement : null) as never,
+            );
 
-        yield* manager.createTab("tab_viewport_replaced_apply");
-        yield* manager.registerWebview("tab_viewport_replaced_apply", 42);
-        yield* Effect.yieldNow;
+            yield* manager.createTab("tab_viewport_replaced_apply");
+            yield* manager.registerWebview("tab_viewport_replaced_apply", 42);
+            yield* Effect.yieldNow;
 
-        const setter = yield* manager
-          .setViewport("tab_viewport_replaced_apply", { width: 1024, height: 768 })
-          .pipe(Effect.forkChild({ startImmediately: true }));
-        yield* Effect.promise(() => applyStarted.promise);
-        yield* manager.registerWebview("tab_viewport_replaced_apply", 43);
-        releaseApply.resolve();
-        yield* Fiber.join(setter);
+            const setter = yield* (
+              source === "toolbar"
+                ? manager.setViewport("tab_viewport_replaced_apply", { width: 1024, height: 768 })
+                : manager.automationSetViewport("tab_viewport_replaced_apply", {
+                    width: 1024,
+                    height: 768,
+                  })
+            ).pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Effect.promise(() => applyStarted.promise);
+            yield* manager.registerWebview("tab_viewport_replaced_apply", 43);
+            releaseApply.resolve();
+            yield* Fiber.join(setter);
 
-        expect(replacementSendCommand).toHaveBeenCalledWith(
-          "Emulation.setDeviceMetricsOverride",
-          expect.objectContaining({ width: 1024, height: 768 }),
-        );
-      }),
-    ),
-  );
+            expect(replacementSendCommand).toHaveBeenCalledWith(
+              "Emulation.setDeviceMetricsOverride",
+              expect.objectContaining({ width: 1024, height: 768 }),
+            );
+          }),
+        ),
+    );
+  }
+
+  for (const takeoverDuring of ["initial apply", "replacement retry"] as const) {
+    effectIt.effect(
+      `interrupts a replaced guest resize after human takeover during ${takeoverDuring}`,
+      () =>
+        withManager((manager) =>
+          Effect.gen(function* () {
+            const tabId = "tab_viewport_replaced_takeover";
+            const initialApplyStarted = Promise.withResolvers<void>();
+            const releaseInitialApply = Promise.withResolvers<void>();
+            const restoreApplied = Promise.withResolvers<void>();
+            const retryStarted = Promise.withResolvers<void>();
+            const releaseRetry = Promise.withResolvers<void>();
+            const takeover = yield* Deferred.make<void>();
+            let humanInput: ((event: unknown, signal?: unknown) => void) | undefined;
+            const firstSendCommand = vi.fn(
+              async (method: string, params?: Record<string, unknown>) => {
+                if (method !== "Emulation.setDeviceMetricsOverride" || params?.width !== 1024)
+                  return;
+                initialApplyStarted.resolve();
+                await releaseInitialApply.promise;
+                if (takeoverDuring === "replacement retry") {
+                  throw new Error("replaced guest rejected viewport");
+                }
+              },
+            );
+            let replacementApplyCount = 0;
+            const replacementSendCommand = vi.fn(
+              async (method: string, params?: Record<string, unknown>) => {
+                if (method !== "Emulation.setDeviceMetricsOverride" || params?.width !== 1024)
+                  return;
+                replacementApplyCount += 1;
+                if (replacementApplyCount === 1) {
+                  restoreApplied.resolve();
+                } else if (takeoverDuring === "replacement retry") {
+                  retryStarted.resolve();
+                  await releaseRetry.promise;
+                }
+              },
+            );
+            const first = makeViewportWebContents(42, firstSendCommand);
+            const replacement = makeViewportWebContents(43, replacementSendCommand);
+            for (const wc of [first, replacement]) {
+              Object.assign(wc.ipc, {
+                on: vi.fn((channel: string, listener: typeof humanInput) => {
+                  if (channel === "preview:human-input") humanInput = listener;
+                }),
+              });
+            }
+            fromId.mockImplementation(
+              (id) => (id === 42 ? first : id === 43 ? replacement : null) as never,
+            );
+            yield* manager.subscribeStateChanges((_tabId, state) =>
+              state.controller === "human"
+                ? Deferred.succeed(takeover, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+            );
+            yield* manager.createTab(tabId);
+            yield* manager.registerWebview(tabId, 42);
+            yield* manager.setViewport(tabId, { width: 390, height: 844 });
+
+            const resize = yield* manager
+              .automationSetViewport(tabId, { width: 1024, height: 768 })
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Effect.promise(() => initialApplyStarted.promise);
+            yield* manager.registerWebview(tabId, 43);
+            yield* Effect.promise(() => restoreApplied.promise);
+            if (takeoverDuring === "replacement retry") {
+              releaseInitialApply.resolve();
+              yield* Effect.promise(() => retryStarted.promise);
+            }
+            humanInput?.({}, { kind: "pointer", x: 10, y: 20, button: 0 });
+            yield* Deferred.await(takeover);
+            releaseInitialApply.resolve();
+            releaseRetry.resolve();
+
+            const exit = yield* Fiber.await(resize);
+            expect(Exit.isFailure(exit)).toBe(true);
+            if (Exit.isSuccess(exit)) return;
+            expect(Option.getOrThrow(Cause.findErrorOption(exit.cause))).toMatchObject({
+              _tag: "PreviewAutomationControlInterruptedError",
+              operation: "resize",
+              tabId,
+              webContentsId: 42,
+            });
+            expect(replacementApplyCount).toBe(takeoverDuring === "initial apply" ? 1 : 2);
+            const replacementViewportCalls = replacementSendCommand.mock.calls.filter(
+              ([method]) => method === "Emulation.setDeviceMetricsOverride",
+            );
+            expect(replacementViewportCalls.at(-1)?.[1]).toMatchObject({ width: 390, height: 844 });
+            yield* manager.setViewport(tabId, { clear: true });
+            expect(replacementSendCommand).toHaveBeenLastCalledWith(
+              "Emulation.clearDeviceMetricsOverride",
+            );
+          }),
+        ),
+    );
+  }
 
   effectIt.effect("clears a rejected viewport after a concurrent session restore", () =>
     withManager((manager) =>
