@@ -354,6 +354,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["automatically open diff pull request pr right panel agent completion"],
   },
   {
+    id: "pull-request-link-browser",
+    title: "Open pull request links in your browser",
+    to: "/settings/general",
+    searchTerms: ["pr mr merge request diff review panel github gitlab"],
+  },
+  {
     id: "skills-in-slash-menu",
     title: "Show skills in slash menu",
     to: "/settings/general",

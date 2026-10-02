@@ -1009,3 +1009,18 @@ it("validates remote device hosts and rejects ambiguous host ids", () => {
   ).toThrow();
   expect(() => decodeDeviceHostSettings({ deviceHosts: [{ ...host, port: 0 }] })).toThrow();
 });
+
+describe("ClientSettings pull request link destination", () => {
+  it("keeps existing settings in the T3 Code pull request view", () => {
+    expect(decodeClientSettings({}).openPullRequestLinksInBrowser).toBe(false);
+    expect(decodeClientSettingsPatch({})).not.toHaveProperty("openPullRequestLinksInBrowser");
+  });
+
+  it.each([true, false])("persists an explicit browser preference of %s", (preference) => {
+    const patch = { openPullRequestLinksInBrowser: preference };
+    expect(decodeClientSettingsPatch(patch)).toEqual(patch);
+    expect(encodeClientSettings(decodeClientSettings(patch)).openPullRequestLinksInBrowser).toBe(
+      preference,
+    );
+  });
+});

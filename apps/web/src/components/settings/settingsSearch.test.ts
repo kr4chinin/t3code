@@ -321,6 +321,13 @@ describe("searchSettings", () => {
     expect(result).not.toHaveProperty("targetId");
   });
 
+  it("finds the pull request browser preference without changing ordinary link results", () => {
+    expect(searchSettings("pull request browser")[0]).toMatchObject({
+      id: "pull-request-link-browser",
+      to: "/settings/general",
+    });
+  });
+
   it("routes where links open to integrations", () => {
     expect(searchSettings("open links in")[0]).toMatchObject({
       id: "browser-link-target",

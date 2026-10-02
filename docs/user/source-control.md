@@ -162,6 +162,10 @@ does not show its diff, so marks are made and read on web and desktop.
 
 ## Linked pull requests
 
+On web and desktop, pull request links open in T3 Code's review panel by default.
+Enable **Settings → General → Open pull request links in your browser** to use your
+default browser instead. `Cmd/Ctrl`-click always opens a link in your browser.
+
 A thread can hold several pull requests, including reviews from another repository on the same host.
 Use **Link pull request** in the command palette or **Linked pull requests** panel, or right-click a
 pull request link in the conversation. Creating a pull request from Git actions links it automatically.

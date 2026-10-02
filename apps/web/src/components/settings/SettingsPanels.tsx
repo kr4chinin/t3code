@@ -586,6 +586,10 @@ export function useSettingsRestore(onRestored?: () => void) {
       ...(settings.proactivePanelsEnabled !== DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled
         ? ["Proactive panels"]
         : []),
+      ...(settings.openPullRequestLinksInBrowser !==
+      DEFAULT_UNIFIED_SETTINGS.openPullRequestLinksInBrowser
+        ? ["Pull request link destination"]
+        : []),
       ...(settings.showSkillsInSlashMenu !== DEFAULT_UNIFIED_SETTINGS.showSkillsInSlashMenu
         ? ["Show skills in slash menu"]
         : []),
@@ -670,6 +674,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       settings.diffIgnoreWhitespace,
       settings.diffLayout,
       settings.proactivePanelsEnabled,
+      settings.openPullRequestLinksInBrowser,
       settings.environmentIdentificationMode,
       settings.contextWindowMeterEnabled,
       settings.fontFamilyCode,
@@ -775,6 +780,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       diffIgnoreWhitespace: DEFAULT_UNIFIED_SETTINGS.diffIgnoreWhitespace,
       diffLayout: DEFAULT_UNIFIED_SETTINGS.diffLayout,
       proactivePanelsEnabled: DEFAULT_UNIFIED_SETTINGS.proactivePanelsEnabled,
+      openPullRequestLinksInBrowser: DEFAULT_UNIFIED_SETTINGS.openPullRequestLinksInBrowser,
       showSkillsInSlashMenu: DEFAULT_UNIFIED_SETTINGS.showSkillsInSlashMenu,
       composerCollapseOnScroll: DEFAULT_UNIFIED_SETTINGS.composerCollapseOnScroll,
       composerRichTextEnabled: DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled,
@@ -2632,6 +2638,34 @@ export function GeneralSettingsPanel() {
                 updateSettings({ proactivePanelsEnabled: Boolean(checked) })
               }
               aria-label="Proactive panels"
+            />
+          }
+        />
+
+        <SettingsRow
+          {...searchableSetting("pull-request-link-browser")}
+          description="Open pull request links in your default browser instead of T3 Code's review panel. Hold ⌘ or Ctrl while clicking to open in your browser either way."
+          resetAction={
+            settings.openPullRequestLinksInBrowser !==
+            DEFAULT_UNIFIED_SETTINGS.openPullRequestLinksInBrowser ? (
+              <SettingResetButton
+                label="pull request link destination"
+                onClick={() =>
+                  updateSettings({
+                    openPullRequestLinksInBrowser:
+                      DEFAULT_UNIFIED_SETTINGS.openPullRequestLinksInBrowser,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.openPullRequestLinksInBrowser}
+              onCheckedChange={(checked) =>
+                updateSettings({ openPullRequestLinksInBrowser: Boolean(checked) })
+              }
+              aria-label="Open pull request links in your browser"
             />
           }
         />

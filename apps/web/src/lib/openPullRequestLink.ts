@@ -18,6 +18,8 @@ import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import { useProjects, useServerConfigs } from "../state/entities";
 import { serverEnvironment } from "../state/server";
 import { usePrimaryEnvironmentId } from "../state/environments";
+import { useClientSettings } from "../hooks/useSettings";
+import { readLocalApi } from "~/localApi";
 
 export {
   parseChangeRequestUrl,
@@ -200,8 +202,26 @@ export function findProjectOnChangeRequestHost(
  */
 export function shouldOpenPullRequestExternally(
   event: Pick<MouseEvent<HTMLElement>, "metaKey" | "ctrlKey">,
+  openInBrowser = false,
 ): boolean {
-  return event.metaKey || event.ctrlKey;
+  return openInBrowser || event.metaKey || event.ctrlKey;
+}
+
+async function openPullRequestInBrowser(url: string): Promise<void> {
+  try {
+    const api = readLocalApi();
+    if (!api) throw new Error("Link opening is unavailable.");
+    await api.shell.openExternal(url);
+  } catch (error) {
+    console.error(error);
+    toastManager.add(
+      stackedThreadToast({
+        type: "error",
+        title: "Unable to open pull request link",
+        description: error instanceof Error ? error.message : "An error occurred.",
+      }),
+    );
+  }
 }
 
 export function useOpenChangeRequestLink(
@@ -220,6 +240,7 @@ export function useOpenChangeRequestLink(
   const allProjects = useProjects();
   const serverConfigs = useServerConfigs();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const openInBrowser = useClientSettings((settings) => settings.openPullRequestLinksInBrowser);
   return useCallback(
     (event, targetUrl, targetThreadRef, targetEnvironmentId) => {
       if (shouldOpenPullRequestExternally(event)) return false;
@@ -227,6 +248,12 @@ export function useOpenChangeRequestLink(
       const resolvedPanelRef = panelRef ?? resolvedThreadRef;
       const parsed = parseChangeRequestUrl(targetUrl);
       if (parsed === null) return false;
+      if (openInBrowser) {
+        event.preventDefault();
+        event.stopPropagation();
+        void openPullRequestInBrowser(targetUrl);
+        return true;
+      }
       const reads = (environmentId: string) =>
         serverConfigs.get(environmentId as EnvironmentId)?.environment.capabilities.pullRequests ===
         true;
@@ -318,26 +345,39 @@ export function useOpenChangeRequestLink(
       });
       return true;
     },
-    [allProjects, navigate, panelRef, primaryEnvironmentId, serverConfigs, threadRef],
+    [
+      allProjects,
+      navigate,
+      openInBrowser,
+      panelRef,
+      primaryEnvironmentId,
+      serverConfigs,
+      threadRef,
+    ],
   );
 }
 
 export function useOpenPrLink(threadRef?: ScopedThreadRef) {
   const openChangeRequest = useOpenChangeRequestLink(threadRef);
   const openLink = useOpenLink(threadRef);
+  const browserPreferred = useClientSettings((settings) => settings.openPullRequestLinksInBrowser);
   return useCallback(
     (event: MouseEvent<HTMLElement>, prUrl: string, targetThreadRef?: ScopedThreadRef) => {
       event.stopPropagation();
-      const openInBrowser = shouldOpenPullRequestExternally(event);
+      const openInBrowser = shouldOpenPullRequestExternally(event, browserPreferred);
       const isAnchor =
         event.currentTarget instanceof HTMLAnchorElement && event.currentTarget.href.length > 0;
       // A real link already knows how to cmd/ctrl+click. Leave its default
       // action alone so the browser (or Electron's window-open handler) opens
       // the host. Buttons have no href, so they still go through openExternal.
-      if (openInBrowser && isAnchor) return false;
+      if (shouldOpenPullRequestExternally(event) && isAnchor) return false;
 
       event.preventDefault();
-      if (!openInBrowser && openChangeRequest(event, prUrl, targetThreadRef)) return true;
+      if (openInBrowser) {
+        void openPullRequestInBrowser(prUrl);
+        return false;
+      }
+      if (openChangeRequest(event, prUrl, targetThreadRef)) return true;
 
       // No project to show it in, so it is an ordinary link and follows the
       // "Open links in" setting; the modifier still forces the system browser.
@@ -353,6 +393,6 @@ export function useOpenPrLink(threadRef?: ScopedThreadRef) {
       });
       return false;
     },
-    [openChangeRequest, openLink],
+    [browserPreferred, openChangeRequest, openLink],
   );
 }

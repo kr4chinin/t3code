@@ -216,6 +216,27 @@ describe("matchesLinkedPullRequestUrl", () => {
 });
 
 describe("shouldOpenPullRequestExternally", () => {
+  it.each([false, true])(
+    "uses the saved browser preference %s for plain clicks",
+    (openInBrowser) => {
+      expect(
+        shouldOpenPullRequestExternally({ metaKey: false, ctrlKey: false }, openInBrowser),
+      ).toBe(openInBrowser);
+    },
+  );
+
+  it.each([false, true])(
+    "keeps modifier clicks external with browser preference %s",
+    (openInBrowser) => {
+      expect(
+        shouldOpenPullRequestExternally({ metaKey: true, ctrlKey: false }, openInBrowser),
+      ).toBe(true);
+      expect(
+        shouldOpenPullRequestExternally({ metaKey: false, ctrlKey: true }, openInBrowser),
+      ).toBe(true);
+    },
+  );
+
   it("uses the browser for command-click and control-click", () => {
     expect(shouldOpenPullRequestExternally({ metaKey: true, ctrlKey: false })).toBe(true);
     expect(shouldOpenPullRequestExternally({ metaKey: false, ctrlKey: true })).toBe(true);
